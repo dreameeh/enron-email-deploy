@@ -23,20 +23,22 @@ class EmailProcessor:
     def __init__(self, batch_size: int = 1000):
         """Initialize the email processor with memory-efficient settings."""
         self.batch_size = batch_size
-        self.email_parser = Parser(policy=default)
         
         # Download required NLTK data
-        try:
-            nltk.data.find('tokenizers/punkt')
-            nltk.data.find('corpora/stopwords')
-        except LookupError:
-            nltk.download('punkt')
-            nltk.download('stopwords')
+        nltk_resources = ['punkt', 'stopwords', 'punkt_tab']
+        for resource in nltk_resources:
+            try:
+                nltk.data.find(f'tokenizers/{resource}')
+            except LookupError:
+                nltk.download(resource)
         
         self.stop_words = set(stopwords.words('english'))
 
     def clean_text(self, text: str) -> str:
         """Clean text content efficiently."""
+        if not isinstance(text, str):
+            return ""
+            
         # Remove email forwarding markers
         text = re.sub(r'(-+)?\s*Forwarded by.*?(-+)?', '', text, flags=re.DOTALL)
         # Remove reply markers
@@ -51,92 +53,94 @@ class EmailProcessor:
 
     def tokenize_and_clean(self, text: str) -> List[str]:
         """Tokenize and clean text efficiently."""
+        if not isinstance(text, str):
+            return []
+            
         # Tokenize
         tokens = word_tokenize(text.lower())
         # Remove stopwords and non-alphabetic tokens
         tokens = [token for token in tokens if token.isalpha() and token not in self.stop_words]
         return tokens
 
-    def extract_email_features(self, email_content: str) -> Dict:
-        """Extract basic features from email content."""
-        try:
-            msg = self.email_parser.parsestr(email_content)
-            
-            # Basic features
-            features = {
-                'subject': msg.get('subject', ''),
-                'from': msg.get('from', ''),
-                'to': msg.get('to', ''),
-                'date': msg.get('date', ''),
-                'body': self.get_email_body(msg),
-            }
-            
-            # Clean the body text
-            features['cleaned_body'] = self.clean_text(features['body'])
-            
-            # Add tokenized text
-            features['tokens'] = self.tokenize_and_clean(features['cleaned_body'])
-            
-            return features
-        except Exception as e:
-            logger.error(f"Error processing email: {str(e)}")
-            return None
-
-    def get_email_body(self, msg: email.message.Message) -> str:
-        """Extract email body efficiently."""
-        body = []
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    body.append(part.get_payload(decode=True).decode('utf-8', errors='ignore'))
-        else:
-            body.append(msg.get_payload(decode=True).decode('utf-8', errors='ignore'))
-        return '\n'.join(body)
-
-    def process_file_batch(self, file_paths: List[str]) -> pd.DataFrame:
-        """Process a batch of email files."""
-        features_list = []
-        for file_path in tqdm(file_paths, desc="Processing files"):
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                features = self.extract_email_features(content)
-                if features:
-                    features['file_path'] = file_path
-                    features_list.append(features)
-            except Exception as e:
-                logger.error(f"Error processing {file_path}: {str(e)}")
+    def process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Process a batch of emails from DataFrame."""
+        logger.info(f"Processing batch of {len(df)} emails")
         
-        return pd.DataFrame(features_list)
-
-    def create_sample_dataset(self, input_dir: str, output_dir: str, sample_size: int = 1000):
-        """Create a smaller sample dataset for testing."""
-        all_files = list(Path(input_dir).rglob('*.txt'))
-        if len(all_files) > sample_size:
-            sample_files = pd.Series(all_files).sample(n=sample_size).tolist()
-        else:
-            sample_files = all_files
+        # Clean body text
+        df['cleaned_body'] = df['message'].apply(self.clean_text)
         
-        df = self.process_file_batch(sample_files)
+        # Add tokenized text
+        df['tokens'] = df['cleaned_body'].apply(self.tokenize_and_clean)
         
-        # Save as parquet for efficiency
-        output_path = Path(output_dir) / 'email_sample.parquet'
-        df.to_parquet(output_path, index=False)
-        logger.info(f"Saved sample dataset to {output_path}")
+        # Add token count
+        df['token_count'] = df['tokens'].apply(len)
+        
         return df
+
+    def process_csv(self, input_file: str, output_dir: str, sample_size: int = None):
+        """Process emails from CSV file in batches."""
+        # Create output directory if it doesn't exist
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Read CSV in chunks
+        chunk_iterator = pd.read_csv(
+            input_file,
+            chunksize=self.batch_size,
+            encoding='utf-8',
+            on_bad_lines='skip'  # Skip problematic lines
+        )
+        
+        processed_chunks = []
+        total_processed = 0
+        
+        for chunk in tqdm(chunk_iterator, desc="Processing email chunks"):
+            if sample_size and total_processed >= sample_size:
+                break
+                
+            # Process the chunk
+            processed_chunk = self.process_dataframe(chunk)
+            processed_chunks.append(processed_chunk)
+            
+            total_processed += len(chunk)
+            
+            # If we have enough chunks or it's the last chunk, save to parquet
+            if len(processed_chunks) * self.batch_size >= 10000 or (sample_size and total_processed >= sample_size):
+                # Combine chunks
+                combined_df = pd.concat(processed_chunks, ignore_index=True)
+                
+                # If sample_size is specified, take only what we need
+                if sample_size:
+                    combined_df = combined_df.head(sample_size)
+                
+                # Save to parquet
+                output_path = Path(output_dir) / f'email_processed_{total_processed}.parquet'
+                combined_df.to_parquet(output_path, index=False)
+                logger.info(f"Saved processed data to {output_path}")
+                
+                # Clear processed chunks to free memory
+                processed_chunks = []
+        
+        # Save any remaining chunks
+        if processed_chunks:
+            combined_df = pd.concat(processed_chunks, ignore_index=True)
+            if sample_size:
+                combined_df = combined_df.head(sample_size)
+            output_path = Path(output_dir) / f'email_processed_final.parquet'
+            combined_df.to_parquet(output_path, index=False)
+            logger.info(f"Saved final batch to {output_path}")
+        
+        logger.info(f"Processed {total_processed} emails successfully")
 
 def main():
     # Initialize processor
-    processor = EmailProcessor()
+    processor = EmailProcessor(batch_size=1000)
     
-    # Create sample dataset
-    sample_df = processor.create_sample_dataset(
-        input_dir='data/raw',
+    # Process sample dataset
+    processor.process_csv(
+        input_file='data/raw/emails.csv',
         output_dir='data/samples',
         sample_size=1000  # Adjust based on your Mac Mini's capacity
     )
-    
-    logger.info(f"Processed {len(sample_df)} emails successfully")
 
 if __name__ == "__main__":
     main()

@@ -2,11 +2,14 @@ import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import logging
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List
+from pathlib import Path
 import re
 from datetime import datetime
-import pyarrow as pa
+import json
 
 # Setup logging
 logging.basicConfig(
@@ -16,119 +19,148 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class FeatureEngineer:
-    def __init__(self, max_features: int = 10000):
+    def __init__(self, max_features: int = 5000, random_state: int = 42):
         """Initialize feature engineering with memory-efficient settings."""
         self.max_features = max_features
+        self.random_state = random_state
         self.tfidf = TfidfVectorizer(
             max_features=max_features,
-            stop_words='english',
-            min_df=2,
-            max_df=0.95
+            min_df=2,  # Ignore terms that appear in less than 2 documents
+            max_df=0.95,  # Ignore terms that appear in more than 95% of documents
+            ngram_range=(1, 2),  # Include unigrams and bigrams
+            strip_accents='unicode',
+            norm='l2'
         )
-        self.label_encoders = {}
-
-    def extract_time_features(self, date_str: str) -> Dict:
-        """Extract time-based features from email date."""
-        try:
-            # Handle various date formats
-            date_formats = [
-                '%a, %d %b %Y %H:%M:%S %z',
-                '%d %b %Y %H:%M:%S %z',
-                '%a, %d %b %Y %H:%M:%S',
-            ]
-            
-            date_obj = None
-            for fmt in date_formats:
-                try:
-                    date_obj = datetime.strptime(date_str.strip(), fmt)
-                    break
-                except ValueError:
-                    continue
-            
-            if date_obj is None:
-                return {'hour': -1, 'day_of_week': -1, 'month': -1}
-            
-            return {
-                'hour': date_obj.hour,
-                'day_of_week': date_obj.weekday(),
-                'month': date_obj.month
-            }
-        except Exception as e:
-            logger.error(f"Error extracting time features: {str(e)}")
-            return {'hour': -1, 'day_of_week': -1, 'month': -1}
-
-    def compute_text_stats(self, text: str) -> Dict:
-        """Compute basic text statistics."""
-        return {
-            'text_length': len(text),
-            'word_count': len(text.split()),
-            'avg_word_length': np.mean([len(w) for w in text.split()]) if text else 0,
-            'contains_question': '?' in text,
-            'contains_exclamation': '!' in text,
-            'url_count': len(re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text))
-        }
-
-    def create_features(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:
-        """Create features from email data efficiently."""
-        logger.info("Starting feature engineering...")
+        self.label_encoder = LabelEncoder()
+        self.scaler = StandardScaler()
         
-        # Create basic text features
-        text_features = df['cleaned_body'].apply(self.compute_text_stats)
-        text_features_df = pd.DataFrame.from_records(text_features)
+    def extract_email_metadata(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract metadata features from emails."""
+        metadata = pd.DataFrame()
         
-        # Create time features
-        time_features = df['date'].apply(self.extract_time_features)
-        time_features_df = pd.DataFrame.from_records(time_features)
+        # Basic count features
+        metadata['token_count'] = df['token_count']
+        metadata['message_length'] = df['message'].str.len()
+        metadata['cleaned_length'] = df['cleaned_body'].str.len()
         
-        # TF-IDF features (memory efficient)
+        # Time-based features (if available)
+        if 'timestamp' in df.columns:
+            metadata['hour'] = pd.to_datetime(df['timestamp']).dt.hour
+            metadata['day_of_week'] = pd.to_datetime(df['timestamp']).dt.dayofweek
+            metadata['is_weekend'] = metadata['day_of_week'].isin([5, 6]).astype(int)
+        
+        # Presence of special characters
+        metadata['has_question_mark'] = df['message'].str.contains(r'\?').astype(int)
+        metadata['has_exclamation'] = df['message'].str.contains(r'!').astype(int)
+        metadata['has_dollar'] = df['message'].str.contains(r'\$').astype(int)
+        metadata['url_count'] = df['message'].str.count(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+        
+        # Email thread features
+        metadata['is_reply'] = df['message'].str.contains(r'^re:', case=False).astype(int)
+        metadata['is_forward'] = df['message'].str.contains(r'^fw:', case=False).astype(int)
+        
+        return metadata
+
+    def create_tfidf_features(self, texts: List[str], is_training: bool = True) -> np.ndarray:
+        """Create TF-IDF features from text."""
         if is_training:
-            tfidf_features = self.tfidf.fit_transform(df['cleaned_body'])
+            tfidf_matrix = self.tfidf.fit_transform(texts)
         else:
-            tfidf_features = self.tfidf.transform(df['cleaned_body'])
+            tfidf_matrix = self.tfidf.transform(texts)
+        return tfidf_matrix
+
+    def prepare_features(self, df: pd.DataFrame, output_dir: str, is_training: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare features for model training or inference."""
+        logger.info("Extracting metadata features...")
+        metadata_features = self.extract_email_metadata(df)
         
-        # Convert sparse matrix to DataFrame efficiently
-        tfidf_df = pd.DataFrame.sparse.from_spmatrix(
-            tfidf_features,
-            columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])]
-        )
+        logger.info("Creating TF-IDF features...")
+        tfidf_features = self.create_tfidf_features(df['cleaned_body'], is_training)
+        
+        # Convert sparse matrix to dense for concatenation
+        tfidf_dense = tfidf_features.toarray()
         
         # Combine all features
-        feature_df = pd.concat([
-            df[['from', 'to']],  # Keep original columns needed for analysis
-            text_features_df,
-            time_features_df,
-            tfidf_df
-        ], axis=1)
+        X = np.hstack([
+            metadata_features.values,
+            tfidf_dense
+        ])
         
-        # Convert categorical variables
-        for col in ['from', 'to']:
-            if is_training:
-                self.label_encoders[col] = LabelEncoder()
-                feature_df[f'{col}_encoded'] = self.label_encoders[col].fit_transform(feature_df[col])
-            else:
-                # Handle unknown categories in test data
-                unknown_categories = ~feature_df[col].isin(self.label_encoders[col].classes_)
-                feature_df.loc[unknown_categories, col] = 'UNKNOWN'
-                feature_df[f'{col}_encoded'] = self.label_encoders[col].transform(feature_df[col])
+        # Scale features
+        if is_training:
+            X_scaled = self.scaler.fit_transform(X)
+        else:
+            X_scaled = self.scaler.transform(X)
         
-        logger.info(f"Created {feature_df.shape[1]} features")
-        return feature_df
+        # Save feature names and parameters if training
+        if is_training:
+            feature_names = (
+                metadata_features.columns.tolist() +
+                [f'tfidf_{i}' for i in range(tfidf_dense.shape[1])]
+            )
+            
+            # Save feature names
+            feature_names_path = Path(output_dir) / 'feature_names.json'
+            with open(feature_names_path, 'w') as f:
+                json.dump(feature_names, f)
+            
+            # Save vectorizer vocabulary
+            vocab_path = Path(output_dir) / 'tfidf_vocabulary.json'
+            with open(vocab_path, 'w') as f:
+                # Convert numpy int64 to regular Python int
+                vocabulary = {k: int(v) for k, v in self.tfidf.vocabulary_.items()}
+                json.dump(vocabulary, f)
+            
+            logger.info(f"Saved feature names to {feature_names_path}")
+            logger.info(f"Saved TF-IDF vocabulary to {vocab_path}")
+        
+        return X_scaled
 
-    def save_features(self, df: pd.DataFrame, output_path: str):
-        """Save features efficiently using parquet format."""
-        df.to_parquet(output_path, index=False)
-        logger.info(f"Saved features to {output_path}")
+    def prepare_training_data(self, input_file: str, output_dir: str, test_size: float = 0.2) -> None:
+        """Prepare data for model training."""
+        # Create output directory
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Load processed data
+        logger.info(f"Loading data from {input_file}")
+        df = pd.read_parquet(input_file)
+        
+        # Prepare features
+        logger.info("Preparing features...")
+        X = self.prepare_features(df, output_dir, is_training=True)
+        
+        # Split into train and test sets
+        logger.info(f"Splitting data with test_size={test_size}")
+        X_train, X_test = train_test_split(
+            X,
+            test_size=test_size,
+            random_state=self.random_state
+        )
+        
+        # Save train and test sets
+        train_path = Path(output_dir) / 'train_features.npz'
+        test_path = Path(output_dir) / 'test_features.npz'
+        
+        np.savez_compressed(train_path, X=X_train)
+        np.savez_compressed(test_path, X=X_test)
+        
+        logger.info(f"Saved training features to {train_path}")
+        logger.info(f"Saved test features to {test_path}")
+        logger.info(f"Feature matrix shape: {X.shape}")
 
 def main():
-    # Load sample data
-    df = pd.read_parquet('data/samples/email_sample.parquet')
-    
     # Initialize feature engineering
-    feature_engineer = FeatureEngineer(max_features=5000)  # Adjust based on your Mac Mini's capacity
+    feature_engineer = FeatureEngineer(
+        max_features=5000,  # Adjust based on your Mac Mini's capacity
+        random_state=42
+    )
     
-    # Create and save features
-    features_df = feature_engineer.create_features(df)
-    feature_engineer.save_features(features_df, 'data/processed/email_features.parquet')
+    # Prepare training data
+    feature_engineer.prepare_training_data(
+        input_file='data/samples/email_processed_1000.parquet',
+        output_dir='data/processed',
+        test_size=0.2
+    )
 
 if __name__ == "__main__":
     main()

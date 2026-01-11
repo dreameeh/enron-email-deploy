@@ -36,3 +36,24 @@ data/samples/
 # OS
 .DS_Store
 .env
+
+# Model caching
+models/cache/
+models/*.bin
+models/*.pt
+models/*.pth
+models/*.ckpt
+.cache/
+wandb/
+lightning_logs/
+
+# Hugging Face cache
+.huggingface/
+
+# Model caching
+models/cache/
+models/*.bin
+models/*.pt
+.cache/
+wandb/
+.huggingface/
